@@ -42,3 +42,6 @@ boot_out.log
 web_boot_err.txt
 web_boot_err2.txt
 *.log
+
+# Third-party packages (installed at runtime)
+vendor/
