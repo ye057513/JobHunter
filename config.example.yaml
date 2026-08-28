@@ -1,0 +1,25 @@
+search:
+  keywords: []
+  city: ""
+  salary_min: 0
+  salary_max: 0
+  education: []
+  experience: []
+  veto_words: []
+  collect_pages: 35
+resume:
+  files: []
+  file: ""
+  info: ""
+llm:
+  api_key: ""
+  base_url: "http://localhost:11434/v1"
+  model: "qwen2.5:7b"
+  temperature: 0.3
+monitor:
+  enabled: false
+  interval_minutes: 300
+browser:
+  headless: true
+  send_interval_min: 30
+  send_interval_max: 60

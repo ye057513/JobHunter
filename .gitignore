@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+pip-wheel-metadata/
+venv/
+.venv/
+
+# Browser profiles (contains cookies, login state, cache)
+chrome_profile/
+edge_profile_test/
+
+# Data files (personal job data, resumes)
+data/
+export/
+logs/
+*._profile
+
+# Config with personal paths
+config.yaml
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs from runtime
+boot_err.log
+boot_out.log
+web_boot_err.txt
+web_boot_err2.txt
+*.log
