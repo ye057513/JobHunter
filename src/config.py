@@ -27,6 +27,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "education": [],       # 学历过滤：如 ["本科", "大专"]
         "experience": [],      # 经验过滤：如 ["应届毕业生", "在校生", "无需经验"]
         "veto_words": [],
+        "city_filter_enabled": True,   # 按目标城市过滤开关：采集后仅保留目标城市(region)命中岗位
+        "target_cities": ["厦门", "福州", "泉州"],  # 目标城市名（子串匹配岗位真实所在地）
     },
     "resume": {
         "files": [],         # 简历文件路径列表（.docx / .pdf）
@@ -47,6 +49,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "headless": False,
         "send_interval_min": 30,
         "send_interval_max": 60,
+    },
+    "platforms": {
+        # 多平台采集配置：每个平台的独立浏览器 profile 目录与是否启用。
+        # 来源标签由 platforms.py 统一管理；这里仅为每个平台补充 profile/开关。
+        "boss": {"enabled": True},
+        "yingsheng": {"enabled": True, "profile": ""},
+        "zhaopin": {"enabled": True, "profile": ""},
+        "51job": {"enabled": True, "profile": ""},
+        "qiuzhifangzhou": {"enabled": True, "profile": ""},
     },
 }
 
@@ -83,6 +94,12 @@ def is_configured() -> bool:
         return False
     cfg = load_config()
     return bool(cfg.get("search", {}).get("keywords"))
+
+
+def get_platform_cfg(key: str) -> Dict[str, Any]:
+    """取某平台的采集配置（config.yaml platforms.<key>），不存在则返回空 dict。"""
+    cfg = load_config()
+    return (cfg.get("platforms") or {}).get(key, {}) or {}
 
 
 def get_llm_client():

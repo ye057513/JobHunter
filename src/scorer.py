@@ -57,6 +57,11 @@ def load_resume() -> str:
     return config.load_resume_text()
 
 
+# 仅当岗位处于"新到未流转"的原始状态时才推进到「待评估」；
+# 若已有人工/上游流转状态（待投递/已投递/简历待优化/面试中等），重评分不得覆盖它。
+_RAW_STATUSES = {"", "新发现", "待处理", "待评估"}
+
+
 def score_job(client, job: Dict[str, Any], resume: str) -> Dict[str, Any]:
     """对单个岗位评分，返回带评分的岗位数据（字段对齐 web.py 七步法）。"""
     description = job.get("description", "")[:2000]
@@ -108,7 +113,8 @@ def score_job(client, job: Dict[str, Any], resume: str) -> Dict[str, Any]:
                     job["skill_gaps"] = f"评分失败：{e}"
                     job["score_reason"] = f"评分失败：{e}"
                     job["score_tags"] = []
-    job["status"] = "待评估"
+    if (job.get("status") or "").strip() in _RAW_STATUSES:
+        job["status"] = "待评估"
     job["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
     return job
 

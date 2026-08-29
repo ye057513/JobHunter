@@ -278,6 +278,19 @@ def _is_closed(job: Dict[str, Any]) -> bool:
     return False
 
 
+def _synth_key(job: Dict[str, Any]) -> str:
+    """空链接(SPA 平台无<a href>)岗位的稳定合成 key：title+company+region 内容指纹。
+
+    保证采集到的岗位能入库判重（重复采集不膨胀），跨平台用 source 区分、避免误撞。
+    """
+    import hashlib
+    src = job.get("source") or job.get("keyword") or "unknown"
+    raw = "|".join(str(job.get(k) or "") for k in ("title", "company", "region", "info"))
+    if not raw.strip():
+        return ""
+    return f"synth:{src}:{hashlib.sha1(raw.encode('utf-8')).hexdigest()[:24]}"
+
+
 def merge_jobs(new_jobs: List[Dict[str, Any]]) -> Dict[str, int]:
     """合并新采集岗位到 jobs.json。
 
@@ -308,6 +321,9 @@ def merge_jobs(new_jobs: List[Dict[str, Any]]) -> Dict[str, int]:
 
     for nj in new_jobs:
         key = nj.get("url") or nj.get("link")
+        if not key:
+            # SPA 平台(应届生等)列表无 <a href>：用内容指纹构造稳定 key，避免误丢岗位
+            key = _synth_key(nj)
         if not key:
             continue
 
@@ -455,6 +471,117 @@ def open_dashboard() -> None:
         _log(f"打开看板失败：{e}")
 
 
+def _apply_city_filter(jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """按「目标城市」过滤岗位：仅保留 job.region / info / city 命中任意目标城市的岗位。
+
+    开关与目标列表来自 config.yaml search.city_filter_enabled / search.target_cities。
+    关闭开关或目标列表为空时原样返回。
+    """
+    try:
+        import config as _cfg
+        search = (_cfg.load_config().get("search") or {}) or {}
+    except Exception:
+        return jobs
+    if not search.get("city_filter_enabled", True):
+        return jobs
+    targets = [str(c).strip() for c in (search.get("target_cities") or []) if str(c).strip()]
+    if not targets:
+        return jobs
+    kept: List[Dict[str, Any]] = []
+    for j in jobs:
+        region = (j.get("region") or "").strip() or (j.get("info") or "").strip() or (j.get("city") or "").strip()
+        if region and any(c in region for c in targets):
+            kept.append(j)
+    return kept
+
+
+def collect_by_platform(platform_key: str, keywords: List[str], cities: List[str],
+                        max_pages: int, on_page=None, engine: str = "api") -> List[Dict[str, Any]]:
+    """按平台分发采集（对齐 Boss：非登录态优先，不足则登录态兜底）。
+
+    engine:
+      - api/anonymous（默认）：非登录态优先 —— 匿名无痕浏览器过 WAF 挑战后抓渲染 DOM；
+        若被要求登录 / 触发验证码捕获不到岗位，自动转入该平台登录态（profile）浏览器采集。
+      - playwright/authed：直接走登录态浏览器采集。
+    platform_key 为 None/''/'boss' 时走现有 Boss recommend API 采集。
+    """
+    if not platform_key or platform_key == "boss":
+        return collect_via_api(keywords, cities, max_pages, on_page=on_page)
+    try:
+        import collectors
+        import config as _cfg
+    except Exception as e:
+        _log(f"加载多平台采集器失败：{e}")
+        _set_collect_error("internal", -1, str(e))
+        return []
+    pcfg = _cfg.get_platform_cfg(platform_key)
+    if not pcfg.get("enabled", True):
+        _set_collect_error("config", None, f"平台已禁用（config.yaml platforms.{platform_key}.enabled=false）")
+        return []
+    browser_cfg = _cfg.load_config().get("browser", {})
+    profile = (pcfg.get("profile") or "").strip()
+    engine = (engine or pcfg.get("engine") or "api").strip() or "api"
+    # 应届生/智联/51job 的真实浏览器采集在 headless 下会被其 WAF(EdgeOne/风控) 拦截，
+    # 已实测只有带登录 profile 的「有头」浏览器能通过；故强制 headless=False。
+    WAF_REQUIRE_HEADED = {"yingsheng", "zhaopin", "51job"}
+    headless = browser_cfg.get("headless", True)
+    if platform_key in WAF_REQUIRE_HEADED:
+        headless = False
+        # 这三平台非登录态匿名必然被 WAF 拦截（已实测），直接走登录态，避免无谓弹窗尝试
+        if engine not in ("playwright", "authed"):
+            engine = "authed"
+    try:
+        col = collectors.get_collector(
+            platform_key,
+            cfg={
+                "headless": headless,
+                "engine": engine,
+                "city_codes": (pcfg.get("city_codes") or {}) or {},
+            },
+            on_page=on_page,
+            profile_dir=Path(profile) if profile else None,
+        )
+        jobs: List[Dict[str, Any]] = []
+        if engine in ("playwright", "authed"):
+            # 登录态直采
+            col.engine_mode = "authed"
+            col.api_used = True
+            jobs = col.collect(keywords, cities, max_pages)
+        else:
+            # 非登录态优先（匿名无痕浏览器）
+            try:
+                jobs = col.collect_non_login(keywords, cities, max_pages)
+            except Exception as e:  # noqa: BLE001
+                col.last_api_error = {"type": "api_error", "message": str(e)}
+            if not jobs:
+                # 空 / 被拦 / 需登录 → 转入登录态兜底
+                err = getattr(col, "last_error", {}) or {}
+                hint = err.get("message", "非登录态未采到岗位")
+                col.api_used = True
+                # 非登录态一旦采不到岗位（含需登录/被拦/解析为空），一律转入登录态兜底
+                _log(f"平台[{platform_key}] 非登录态：{hint}；转入登录态采集…")
+                col.engine_mode = "authed"
+                col._collect_error = {}
+                try:
+                    jobs = col.collect(keywords, cities, max_pages)
+                except Exception as e:  # noqa: BLE001
+                    _log(f"平台[{platform_key}] 登录态采集异常：{e}")
+                    _set_collect_error("collect", None, str(e))
+                    return []
+            else:
+                col.api_used = False
+        jobs = _apply_city_filter(jobs)
+        last_err = getattr(col, "last_error", {}) or {}
+        # 仅透传「真正失败」的错误（采到数据则清空，避免残留旧提示）
+        if last_err and not jobs:
+            _set_collect_error(last_err.get("type", "collect"), last_err.get("code"), last_err.get("message", ""))
+        return jobs
+    except Exception as e:
+        _log(f"平台[{platform_key}] 采集异常：{e}")
+        _set_collect_error("collect", None, str(e))
+        return []
+
+
 def run() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--engine", choices=["api", "authed", "playwright"], default="api",
@@ -464,6 +591,8 @@ def run() -> int:
     parser.add_argument("--no-jd", action="store_true", help="跳过 JD 详情抓取（轻量模式，与 --max-jd 0 等价）")
     parser.add_argument("--max-jd", type=int, default=0, help="最多抓取前 N 条 JD 详情（默认 0=不抓详情；详情页请求最易触发风控，建议保持 0）")
     parser.add_argument("--max-keywords", type=int, default=1, help="本轮最多采集关键词数（风控建议 1，单轮轻量）")
+    parser.add_argument("--platform", default="boss",
+                        help="采集平台 key：boss / yingsheng / zhaopin / 51job / qiuzhifangzhou（默认 boss）")
     args = parser.parse_args()
 
     cfg = config.load_config()
@@ -491,7 +620,12 @@ def run() -> int:
         result = {"keywords": keywords, "cities": cities, "blocked": False, "login_lost": False, "collected": 0}
         _log(f"启动随机冷却 {DELAY_BOOT[0]}~{DELAY_BOOT[1]} 秒…")
         _sleep(*DELAY_BOOT)
-        all_jobs = collect_via_api(keywords, cities, args.pages)
+        platform_key = (args.platform or "boss").strip()
+        if platform_key not in ("", "boss"):
+            _log(f"使用多平台采集框架：{platform_key}（engine={args.engine}）")
+            all_jobs = collect_by_platform(platform_key, keywords, cities, args.pages, engine=args.engine)
+        else:
+            all_jobs = collect_via_api(keywords, cities, args.pages)
         result["collected"] = len(all_jobs)
         _log(f"API 采集合计 {len(all_jobs)} 条")
         if all_jobs:

@@ -243,14 +243,15 @@ def _classify_collect_error(exc: Exception, last: Dict[str, Any]) -> tuple:
 # 后台任务 Worker
 # ---------------------------------------------------------------------------
 
-def _run_collect_worker() -> None:
-    """采集线程：api 引擎轻量采集 → 智能过滤 → 合并入库 → 打轮次日志。
+def _run_collect_worker(platform_key: str = "boss") -> None:
+    """采集线程：按平台分发采集 → 智能过滤 → 合并入库 → 打轮次日志。
 
     安全措施（保留不变）：
     - 启动随机冷却（DELAY_BOOT 10-30s）
-    - 最小 cookie（仅 wt2），不携带完整登录态
+    - Boss 用最小 cookie（仅 wt2），不携带完整登录态
     - 单关键词、单页采集（风控限量）
     - smart_filter 技术栈过滤
+    - 其余平台走 collectors 框架（Playwright 登录态，见 collectors.py）
     """
     started = _now()
     _set_state(_collect_state, _collect_lock, running=True, done=False, ok=False,
@@ -274,7 +275,15 @@ def _run_collect_worker() -> None:
                        message="未配置搜索关键词", stage="未配置关键词", finished_at=_now(),
                        error_type="配置缺失", error_message="未配置搜索关键词，请到「配置」页填写关键词后再采集。")
             return
-        _set_state(_collect_state, _collect_lock, percent=8, stage="准备启动（冷却防风控）…")
+        platform_key = platform_key or "boss"
+        try:
+            import platforms as platforms_mod
+            plat = platforms_mod.by_key(platform_key) or {}
+            plat_label = plat.get("label", platform_key)
+            plat_source = plat.get("source", platform_key)
+        except Exception:
+            plat_label, plat_source = platform_key, platform_key
+        _set_state(_collect_state, _collect_lock, percent=8, stage=(f"准备在「{plat_label}」启动（冷却防风控）…"))
 
         boot_lo, boot_hi = fetch_jobs.DELAY_BOOT
         boot_total = random.uniform(boot_lo, boot_hi)
@@ -285,15 +294,21 @@ def _run_collect_worker() -> None:
             _set_state(_collect_state, _collect_lock, percent=pct, stage="启动冷却中…")
             ws_mgr.broadcast({"type": "progress", "task": "collect", "percent": pct, "stage": "启动冷却中…"})
 
-        _set_state(_collect_state, _collect_lock, percent=42, stage="正在采集岗位…")
-        ws_mgr.broadcast({"type": "progress", "task": "collect", "percent": 42, "stage": "正在采集岗位…"})
+        _set_state(_collect_state, _collect_lock, percent=42, stage=f"正在采集「{plat_label}」岗位…")
+        ws_mgr.broadcast({"type": "progress", "task": "collect", "percent": 42, "stage": f"正在采集「{plat_label}」岗位…"})
         collect_pages = int(cfg.get("search", {}).get("collect_pages", 35))
-        all_jobs = fetch_jobs.collect_via_api(keywords, cities, max_pages=collect_pages,
-                                              on_page=lambda p, total: ws_mgr.broadcast({
-                                                  "type": "progress", "task": "collect",
-                                                  "percent": 42 + int(p / max(1, total) * 35),
-                                                  "stage": f"正在采集岗位… 第 {p}/{total} 页"
-                                              }))
+        # 浏览器采集平台(应届生/智联/51job/求职方舟)每次采集页数上限更低，避免长时间高频加载
+        if platform_key != "boss":
+            collect_pages = min(collect_pages, 5)
+        all_jobs = fetch_jobs.collect_by_platform(
+            platform_key,
+            keywords, cities,
+            max_pages=collect_pages,
+            on_page=lambda p, total: ws_mgr.broadcast({
+                "type": "progress", "task": "collect",
+                "percent": 42 + int(p / max(1, total) * 35),
+                "stage": f"正在采集「{plat_label}」岗位… 第 {p}/{total} 页"
+            }))
 
         _set_state(_collect_state, _collect_lock, percent=70, stage="智能过滤…")
         ws_mgr.broadcast({"type": "progress", "task": "collect", "percent": 70, "stage": "智能过滤…"})
@@ -313,7 +328,8 @@ def _run_collect_worker() -> None:
             pass
 
         result = {"keywords": keywords, "cities": cities, "blocked": False,
-                  "login_lost": False, "collected": len(all_jobs)}
+                  "login_lost": False, "collected": len(all_jobs),
+                  "platform": platform_key, "source": plat_source, "platform_label": plat_label}
         if all_jobs:
             _set_state(_collect_state, _collect_lock, percent=85, stage="合并入库…")
             ws_mgr.broadcast({"type": "progress", "task": "collect", "percent": 85, "stage": "合并入库…"})
@@ -328,7 +344,7 @@ def _run_collect_worker() -> None:
         total = result.get("total", 0)
         dup = result.get("dup", 0)
         closed = result.get("closed", 0)
-        parts = [f"采得 {len(all_jobs)} 条，新增 {added} 条"]
+        parts = [f"「{plat_label}」采得 {len(all_jobs)} 条，新增 {added} 条"]
         if dup:
             parts.append(f"，同内容重复跳过 {dup} 条")
         if closed:
@@ -940,18 +956,34 @@ async def api_jobs_compare(request: Request):
 # ---------------------------------------------------------------------------
 
 @app.post("/api/collect")
-def api_collect():
+def api_collect(platform: str = "boss"):
+    # 通过 query 或 JSON body 均可传 platform；按平台进行分类采集
+    import platforms as platforms_mod
+    if platform not in platforms_mod.PLATFORMS:
+        platform = "boss"
     with _collect_lock:
         if _collect_state.get("running"):
             return {"ok": True, "running": True, "message": "正在采集中，请稍候"}
-        threading.Thread(target=_run_collect_worker, daemon=True).start()
-    return {"ok": True, "running": True, "message": "已开始采集（约需 30 秒）"}
+        threading.Thread(target=_run_collect_worker, args=(platform,), daemon=True).start()
+    try:
+        label = platforms_mod.PLATFORMS[platform]["label"]
+    except Exception:
+        label = platform
+    return {"ok": True, "running": True, "platform": platform,
+            "message": f"已开始在「{label}」采集（约需 30 秒）"}
 
 
 @app.get("/api/collect/status")
 def api_collect_status():
     with _collect_lock:
         return dict(_collect_state)
+
+
+@app.get("/api/platforms")
+def api_platforms():
+    """返回平台注册表元数据，供前端渲染「平台栏目」。"""
+    import platforms as platforms_mod
+    return {"platforms": platforms_mod.all_platforms()}
 
 
 # ---------------------------------------------------------------------------
@@ -1472,6 +1504,13 @@ a{color:var(--blue);text-decoration:none;}
 .filterbar input,.filterbar select{padding:5px 10px;border:1px solid var(--line);border-radius:6px;font-size:13px;color:var(--ink);background:var(--card);transition:border-color .2s;}
 .filterbar input:focus,.filterbar select:focus{outline:none;border-color:var(--blue);box-shadow:0 0 0 2px rgba(0,117,222,.1);}
 .filterbar .count{font-size:12px;color:var(--ink-3);margin-left:auto;}
+/* 平台栏目条（按求职平台分类展示，Boss/应届生/智联/51job/求职方舟各成栏目） */
+.platformbar{display:flex;align-items:center;gap:8px;padding:8px 20px 0;flex-wrap:wrap;background:var(--card);}
+.platformbar .plb{display:inline-flex;align-items:center;gap:6px;padding:6px 14px;border:1px solid var(--line);border-radius:20px;font-size:13px;color:var(--ink-2);background:var(--bg);cursor:pointer;transition:all .15s;user-select:none;}
+.platformbar .plb .dot{width:9px;height:9px;border-radius:50%;flex:none;}
+.platformbar .plb .cnt{font-size:11px;color:var(--ink-3);}
+.platformbar .plb:hover{border-color:var(--blue);color:var(--blue);}
+.platformbar .plb.active{border-color:var(--blue);color:var(--blue);background:var(--blue-soft);font-weight:600;}
 .board-wrap{overflow-x:auto;padding:12px 20px;}
 .board{display:flex;gap:12px;min-width:max-content;}
 .column{width:280px;flex-shrink:0;background:var(--card);border:1px solid var(--line);border-radius:var(--radius-lg);box-shadow:var(--shadow);display:flex;flex-direction:column;max-height:calc(100vh - 200px);}
@@ -1495,6 +1534,7 @@ a{color:var(--blue);text-decoration:none;}
 .jc-title{font-size:13px;font-weight:600;line-height:1.3;margin-bottom:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .jc-meta{display:flex;gap:6px;font-size:11px;color:var(--ink-2);overflow:hidden;}
 .jc-meta span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.jc-meta .jc-src{font-weight:600;flex:none;}
 .jc-detail{max-height:0;overflow:hidden;transition:max-height .3s ease;}
 .job-card:hover .jc-detail{max-height:100px;}
 .jc-mp{font-size:10px;color:var(--green);margin-top:4px;line-height:1.3;overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;}
@@ -1604,6 +1644,7 @@ body.batch-mode .job-card:hover .jc-detail{max-height:0;}
 <span class="task-stage" id="taskStage">准备中…</span>
 </div>
 <div class="statsbar" id="statsbar"></div>
+<div class="platformbar" id="platformbar"></div>
 <div class="filterbar" id="filterbar">
 <input type="text" id="fSearch" placeholder="搜索岗位/公司/城市…" style="width:200px">
 <select id="fCity"><option value="">全部城市</option></select>
@@ -1654,6 +1695,7 @@ body.batch-mode .job-card:hover .jc-detail{max-height:0;}
 <div class="field"><label>薪资</label><input id="amSalary"></div>
 </div>
 <div class="field"><label>招聘链接</label><input id="amUrl" placeholder="可留空，自动生成"></div>
+<div class="field"><label>来源平台</label><select id="amSource"><option value="">（手动录入）</option></select></div>
 <div class="field"><label>岗位描述</label><textarea id="amDesc" rows="3"></textarea></div>
 </div>
 <div class="modal-foot">
@@ -1703,7 +1745,7 @@ body.batch-mode .job-card:hover .jc-detail{max-height:0;}
 <div class="toast" id="toast"></div>
 <script>
 // ===== State =====
-let JOBS=[],MESSAGES=[],currentView='board',batchMode=false;
+let JOBS=[],MESSAGES=[],PLATFORMS=[],curSource='',currentView='board',batchMode=false;
 let selectedUrls=new Set(),currentDetailUrl='',detailModified={};
 const STATUS_COLORS={'新发现':'#9b9a97','待评估':'#0075de','简历待优化':'#cb9d06','待投递':'#0f7b6c','已投递':'#6c5ce7','笔试测评':'#e17055','面试中':'#e84393','等待结果':'#fdcb6e','Offer':'#00b894','暂不考虑已结束':'#636e72','已停招':'#555555'};
 const STATUSES=['新发现','待评估','简历待优化','待投递','已投递','笔试测评','面试中','等待结果','Offer','暂不考虑已结束','已停招'];
@@ -1750,8 +1792,11 @@ const text=await r.text();
 JOBS=JSON.parse(text);
 const mr=await fetch('/api/messages').catch(()=>({json:()=>[]}));
 MESSAGES=await mr.json();
+// 平台元数据（幂等缓存）
+try{const pr=await fetch('/api/platforms');const pd=await pr.json();PLATFORMS=(pd.platforms||[]).slice();}catch(e){}
 renderStats();
 renderFilters();
+renderPlatforms();
 render();
 }catch(e){
 $('board').innerHTML='<div style="padding:40px;text-align:center;color:#c43e2d;font-size:14px">数据加载失败: '+esc(e.message)+'<br><br>请检查服务是否正常运行，或刷新页面重试。<br><button onclick="location.reload()" style="margin-top:12px;padding:6px 16px;background:#5b8def;color:#fff;border:none;border-radius:4px;cursor:pointer">刷新页面</button></div>';
@@ -1816,11 +1861,11 @@ if(saved.city&&cv==='')citySel.value=saved.city;
 if(saved.source&&sv==='')srcSel.value=saved.source;
 if(saved.priority)$('fPriority').value=saved.priority;
 if(saved.score)$('fScore').value=saved.score;
+curSource=srcSel.value;
 }
 function getFiltered(){
 const q=$('fSearch').value.toLowerCase();
-const city=$('fCity').value,src=$('fSource').value,pri=$('fPriority').value,sc=$('fScore').value;
-let r=JOBS;
+const city=$('fCity').value,src=curSource,pri=$('fPriority').value,sc=$('fScore').value;let r=JOBS;
 if(q)r=r.filter(j=>(j.title+' '+j.company+' '+j.city).toLowerCase().includes(q));
 if(city)r=r.filter(j=>j.city===city);
 if(src)r=r.filter(j=>j.source===src);
@@ -1828,7 +1873,32 @@ if(pri)r=r.filter(j=>j.priority===pri);
 if(sc)r=r.filter(j=>(j.match_score||0)>=parseInt(sc));
 return r;
 }
-function saveFilters(){localStorage.setItem('jh_filters',JSON.stringify({search:$('fSearch').value,city:$('fCity').value,source:$('fSource').value,priority:$('fPriority').value,score:$('fScore').value}));}
+// ===== Platform Bar（按求职平台分类展示） =====
+function platformColor(p){let c=p&&p.color;return c||'#888';}
+function renderPlatforms(){
+const bar=$('platformbar');
+// 「全部」栏：默认高亮「全部」，平台栏目独立状态 curSource 不依赖 #fSource 下拉
+let curSrc=curSource||'';
+const total=JOBS.length;
+const allActive=!curSrc;
+function tab(label,color,cnt,active,source,dot){
+return '<div class="plb'+(active?' active':'')+'" data-src="'+esc(source)+'" onclick="selectPlatform(\''+esc(source||'')+'\')">'
++(dot?'<span class="dot" style="background:'+color+'"></span>':'')
++esc(label)+'<span class="cnt">'+cnt+'</span></div>';
+}
+let html=tab('全部','#555',total,allActive,'',true);
+(PLATFORMS||[]).forEach(p=>{
+const cnt=JOBS.filter(j=>j.source===p.source).length;
+html+=tab(p.label,p.color||'#888',cnt,curSrc===p.source,p.source,true);
+});
+bar.innerHTML=html;
+}
+function selectPlatform(source){
+curSource=source||'';
+const sel=$('fSource');if(sel)sel.value=curSource; // 尽力同步下拉；无对应option时select会静默拒绝，但不影响栏目高亮
+saveFilters();render();renderPlatforms();
+}
+function saveFilters(){localStorage.setItem('jh_filters',JSON.stringify({search:$('fSearch').value,city:$('fCity').value,source:curSource,priority:$('fPriority').value,score:$('fScore').value}));}
 
 // ===== Board Rendering =====
 function render(){
@@ -1865,7 +1935,9 @@ let extra='';
 if(j.action_deadline)extra+='<div class="jc-deadline">⏰ '+esc(fmtDate(j.action_deadline))+'</div>';
 if(j.greeting)extra+='<div class="jc-greeting">💬 已有招呼语</div>';
 const checkbox=batchMode?'<input type="checkbox" class="jc-check" data-url="'+esc(j.url)+'" '+(selectedUrls.has(j.url)?'checked':'')+' onclick="event.stopPropagation()">':'';
-return '<div class="job-card" draggable="'+(batchMode?'false':'true')+'" data-url="'+esc(j.url)+'" onclick="onCardClick(\''+esc(j.url)+'\')"><div class="jc-head"><span class="jc-pri pri-'+j.priority+'">'+j.priority+'</span><span class="jc-score" style="color:'+sc+'">'+s+'</span></div><div class="jc-title">'+esc(j.title)+'</div><div class="jc-meta"><span>'+esc(j.company)+'</span><span>'+esc(j.city||'')+'</span><span>'+esc(j.salary||'')+'</span></div><div class="jc-detail">'+detail+extra+'</div>'+checkbox+'</div>';
+const pcol=(PLATFORMS.find(p=>p.source===j.source)||{}).color||'#888';
+const srcBadge='<span class="jc-src" style="color:'+pcol+'">'+esc(j.source||'')+'</span>';
+return '<div class="job-card" draggable="'+(batchMode?'false':'true')+'" data-url="'+esc(j.url)+'" onclick="onCardClick(\''+esc(j.url)+'\')"><div class="jc-head"><span class="jc-pri pri-'+j.priority+'">'+j.priority+'</span><span class="jc-score" style="color:'+sc+'">'+s+'</span></div><div class="jc-title">'+esc(j.title)+'</div><div class="jc-meta">'+srcBadge+'<span>'+esc(j.company)+'</span><span>'+esc(j.city||'')+'</span><span>'+esc(j.salary||'')+'</span></div><div class="jc-detail">'+detail+extra+'</div>'+checkbox+'</div>';
 }
 
 // ===== Calendar Rendering =====
@@ -2025,11 +2097,16 @@ toast(data.message||'已启动');
 
 // ===== Add Modal =====
 function closeAdd(){$('addOverlay').classList.remove('show');}
+function fillAddSource(){
+const sel=$('amSource');if(!sel)return;
+const cur=sel.value;
+sel.innerHTML='<option value="">（手动录入）</option>'+(PLATFORMS||[]).map(p=>'<option value="'+esc(p.source)+'"'+(p.source===cur?' selected':'')+'>'+esc(p.label)+'</option>').join('');
+}
 async function submitAdd(){
-const data={title:$('amTitle').value,company:$('amCompany').value,city:$('amCity').value,salary:$('amSalary').value,url:$('amUrl').value,description:$('amDesc').value};
+const data={title:$('amTitle').value,company:$('amCompany').value,city:$('amCity').value,salary:$('amSalary').value,url:$('amUrl').value,description:$('amDesc').value,source:$('amSource').value};
 if(!data.title||!data.company){toast('岗位名称和公司名称为必填');return;}
 const r=await api('/api/jobs/add',data);
-toast(r.message);if(r.ok){closeAdd();reload();$('amTitle').value='';$('amCompany').value='';$('amCity').value='';$('amSalary').value='';$('amUrl').value='';$('amDesc').value='';}
+toast(r.message);if(r.ok){closeAdd();reload();$('amTitle').value='';$('amCompany').value='';$('amCity').value='';$('amSalary').value='';$('amUrl').value='';$('amDesc').value='';$('amSource').value='';}
 }
 
 // ===== Batch Operations =====
@@ -2077,6 +2154,7 @@ catch(e){return{ok:false,message:'请求失败'};}
 // ===== Task Button Setup =====
 function setupTaskButton(btnId,startApi,statusApi){
 const btn=$(btnId);if(!btn)return;
+const startUrlFor=()=>typeof startApi==='function'?startApi():startApi;
 const originalText=btn.textContent;
 btn.onclick=async()=>{
 if(btn.disabled)return;
@@ -2086,7 +2164,7 @@ let data=null,lastErr=null;
 const rightPlace=(location.port==='8686');
 for(let i=0;i<12;i++){
 try{
-const r=await fetch(startApi,{method:'POST',cache:'no-store'});
+const r=await fetch(startUrlFor(),{method:'POST',cache:'no-store'});
 const ct=(r.headers.get('Content-Type')||'').toLowerCase();
 data=ct.indexOf('json')>=0?await r.json():{ok:false,message:'服务返回异常('+r.status+')，请确认看板服务已启动'};
 break;
@@ -2271,16 +2349,17 @@ if(localStorage.getItem('jh_theme')==='dark')$('btnDark').textContent='☀️';
 // Navigation
 document.querySelectorAll('.nav a[data-view]').forEach(a=>a.onclick=()=>switchView(a.dataset.view));
 // Filters
-['fSearch','fCity','fSource','fPriority','fScore'].forEach(id=>$(id).oninput=()=>{saveFilters();render();});
+['fSearch','fCity','fPriority','fScore'].forEach(id=>$(id).oninput=()=>{saveFilters();render();});
 $('fSearch').oninput=()=>{saveFilters();render();};
+$('fSource').onchange=()=>{curSource=$('fSource').value;saveFilters();render();renderPlatforms();};
 // Buttons
-$('btnAdd').onclick=()=>$('addOverlay').classList.add('show');
+$('btnAdd').onclick=()=>{fillAddSource();$('addOverlay').classList.add('show');};
 $('btnBatch').onclick=toggleBatch;
 $('btnExport').onclick=exportData;
 $('btnLogin').onclick=openLogin;
 $('cmLoginBtn').onclick=openLogin;
 $('btnLoginRegen').onclick=startLogin;
-setupTaskButton('btnCollect','/api/collect','/api/collect/status');
+setupTaskButton('btnCollect',()=>{const src=curSource;const p=PLATFORMS.find(x=>x.source===src);const key=(p?p.key:'boss')||'boss';return '/api/collect?platform='+encodeURIComponent(key);},'/api/collect/status');
 setupTaskButton('btnScore','/api/score','/api/score/status');
 setupTaskButton('btnGreet','/api/greet','/api/greet/status');
 setupTaskButton('btnMonitor','/api/monitor','/api/monitor/status');
