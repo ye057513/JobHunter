@@ -28,7 +28,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "experience": [],      # 经验过滤：如 ["应届毕业生", "在校生", "无需经验"]
         "veto_words": [],
         "city_filter_enabled": True,   # 按目标城市过滤开关：采集后仅保留目标城市(region)命中岗位
-        "target_cities": ["厦门", "福州", "泉州"],  # 目标城市名（子串匹配岗位真实所在地）
+        "target_cities": ["厦门", "福州", "泉州", "南昌"],  # 目标城市名（子串匹配岗位真实所在地）
     },
     "resume": {
         "files": [],         # 简历文件路径列表（.docx / .pdf）

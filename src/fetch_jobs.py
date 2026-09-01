@@ -181,7 +181,7 @@ def _fetch_jd(page, url: str) -> str:
 def collect_keyword(page, keyword: str, city: str, max_pages: int, max_jd: int = 0) -> List[Dict[str, Any]]:
     jobs: List[Dict[str, Any]] = []
     # 城市编码映射（Boss直聘 city code）
-    city_code = {"厦门": "101230200", "福州": "101230100", "泉州": "101230500"}.get(city, "101230200")
+    city_code = {"厦门": "101230200", "福州": "101230100", "泉州": "101230500", "南昌": "101240100"}.get(city, "101230200")
     base = f"{SEARCH_URL}?query={keyword}&city={city_code}"
     _log(f"关键词[{keyword}] 城市[{city}] 搜索：{base}")
     try:
